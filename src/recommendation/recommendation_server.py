@@ -16,6 +16,7 @@ from opentelemetry._logs import set_logger_provider
 from opentelemetry.exporter.otlp.proto.grpc._log_exporter import (
     OTLPLogExporter,
 )
+from opentelemetry.processor.baggage import BaggageSpanProcessor
 from opentelemetry.sdk._logs import LoggerProvider, LoggingHandler
 from opentelemetry.sdk._logs.export import BatchLogRecordProcessor
 from opentelemetry.sdk.resources import Resource
@@ -132,6 +133,12 @@ if __name__ == "__main__":
     api.add_hooks([TracingHook()])
 
     # Initialize Traces and Metrics
+    # opentelemetry-instrument has already set up the SDK TracerProvider;
+    # add our BaggageSpanProcessor to it so session.id from inbound baggage
+    # is stamped on every span.
+    trace.get_tracer_provider().add_span_processor(
+        BaggageSpanProcessor(lambda key: key == "session.id")
+    )
     tracer = trace.get_tracer_provider().get_tracer(service_name)
     meter = metrics.get_meter_provider().get_meter(service_name)
     rec_svc_metrics = init_metrics(meter)

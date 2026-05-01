@@ -90,6 +90,7 @@ func initTracerProvider() *sdktrace.TracerProvider {
 		logger.Error(fmt.Sprintf("new otlp trace grpc exporter failed: %v", err))
 	}
 	tp := sdktrace.NewTracerProvider(
+		sdktrace.WithSpanProcessor(newBaggageSpanProcessor("session.id")),
 		sdktrace.WithBatcher(exporter),
 		sdktrace.WithResource(initResource()),
 	)

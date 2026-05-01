@@ -64,6 +64,7 @@ Action<ResourceBuilder> appResourceBuilder =
 builder.Services.AddOpenTelemetry()
     .ConfigureResource(appResourceBuilder)
     .WithTracing(tracerBuilder => tracerBuilder
+        .AddProcessor(new cart.telemetry.BaggageSpanProcessor(key => key == "session.id"))
         .AddSource("OpenTelemetry.Demo.Cart")
         .AddRedisInstrumentation(
             options => options.SetVerboseDatabaseStatements = true)
