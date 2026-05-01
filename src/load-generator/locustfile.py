@@ -118,24 +118,27 @@ class WebsiteUser(HttpUser):
     def __init__(self, *args, **kwargs):
         super().__init__(*args, **kwargs)
         self.tracer = trace.get_tracer(__name__)
+        # Default until on_start() runs; ensures tasks always have a valid
+        # parent context even if Locust schedules one before on_start finishes.
+        self.session_context = Context()
 
     @task(1)
     def index(self):
-        with self.tracer.start_as_current_span("user_index", context=Context()):
+        with self.tracer.start_as_current_span("user_index", context=self.session_context):
             logging.info("User accessing index page")
             self.client.get("/")
 
     @task(10)
     def browse_product(self):
         product = random.choice(products)
-        with self.tracer.start_as_current_span("user_browse_product", context=Context(), attributes={"product.id": product}):
+        with self.tracer.start_as_current_span("user_browse_product", context=self.session_context, attributes={"product.id": product}):
             logging.info(f"User browsing product: {product}")
             self.client.get("/api/products/" + product)
 
     @task(3)
     def get_recommendations(self):
         product = random.choice(products)
-        with self.tracer.start_as_current_span("user_get_recommendations", context=Context(), attributes={"product.id": product}):
+        with self.tracer.start_as_current_span("user_get_recommendations", context=self.session_context, attributes={"product.id": product}):
             logging.info(f"User getting recommendations for product: {product}")
             params = {
                 "productIds": [product],
@@ -145,7 +148,7 @@ class WebsiteUser(HttpUser):
     @task(3)
     def get_ads(self):
         category = random.choice(categories)
-        with self.tracer.start_as_current_span("user_get_ads", context=Context(), attributes={"category": str(category)}):
+        with self.tracer.start_as_current_span("user_get_ads", context=self.session_context, attributes={"category": str(category)}):
             logging.info(f"User getting ads for category: {category}")
             params = {
                 "contextKeys": [category],
@@ -154,7 +157,7 @@ class WebsiteUser(HttpUser):
 
     @task(3)
     def view_cart(self):
-        with self.tracer.start_as_current_span("user_view_cart", context=Context()):
+        with self.tracer.start_as_current_span("user_view_cart", context=self.session_context):
             logging.info("User viewing cart")
             self.client.get("/api/cart")
 
@@ -164,7 +167,7 @@ class WebsiteUser(HttpUser):
             user = str(uuid.uuid1())
         product = random.choice(products)
         quantity = random.choice([1, 2, 3, 4, 5, 10])
-        with self.tracer.start_as_current_span("user_add_to_cart", context=Context(), attributes={"user.id": user, "product.id": product, "quantity": quantity}):
+        with self.tracer.start_as_current_span("user_add_to_cart", context=self.session_context, attributes={"user.id": user, "product.id": product, "quantity": quantity}):
             logging.info(f"User {user} adding {quantity} of product {product} to cart")
             self.client.get("/api/products/" + product)
             cart_item = {
@@ -179,7 +182,7 @@ class WebsiteUser(HttpUser):
     @task(1)
     def checkout(self):
         user = str(uuid.uuid1())
-        with self.tracer.start_as_current_span("user_checkout_single", context=Context(), attributes={"user.id": user}):
+        with self.tracer.start_as_current_span("user_checkout_single", context=self.session_context, attributes={"user.id": user}):
             self.add_to_cart(user=user)
             checkout_person = random.choice(people)
             checkout_person["userId"] = user
@@ -190,7 +193,7 @@ class WebsiteUser(HttpUser):
     def checkout_multi(self):
         user = str(uuid.uuid1())
         item_count = random.choice([2, 3, 4])
-        with self.tracer.start_as_current_span("user_checkout_multi", context=Context(),
+        with self.tracer.start_as_current_span("user_checkout_multi", context=self.session_context,
                                             attributes={"user.id": user, "item.count": item_count}):
             for i in range(item_count):
                 self.add_to_cart(user=user)
@@ -203,18 +206,21 @@ class WebsiteUser(HttpUser):
     def flood_home(self):
         flood_count = get_flagd_value("loadGeneratorFloodHomepage")
         if flood_count > 0:
-            with self.tracer.start_as_current_span("user_flood_home",  context=Context(), attributes={"flood.count": flood_count}):
+            with self.tracer.start_as_current_span("user_flood_home",  context=self.session_context, attributes={"flood.count": flood_count}):
                 logging.info(f"User flooding homepage {flood_count} times")
                 for _ in range(0, flood_count):
                     self.client.get("/")
 
     def on_start(self):
-        with self.tracer.start_as_current_span("user_session_start", context=Context()):
-            session_id = str(uuid.uuid4())
-            logging.info(f"Starting user session: {session_id}")
-            ctx = baggage.set_baggage("session.id", session_id)
-            ctx = baggage.set_baggage("synthetic_request", "true", context=ctx)
-            context.attach(ctx)
+        session_id = str(uuid.uuid4())
+        logging.info(f"Starting user session: {session_id}")
+        ctx = baggage.set_baggage("session.id", session_id)
+        ctx = baggage.set_baggage("synthetic_request", "true", context=ctx)
+        # Stash for use as parent context in every task — keeps each task as
+        # its own trace root (no parent span) while letting baggage flow.
+        self.session_context = ctx
+        context.attach(ctx)
+        with self.tracer.start_as_current_span("user_session_start", context=self.session_context):
             self.index()
 
 
@@ -227,11 +233,20 @@ if browser_traffic_enabled:
         def __init__(self, *args, **kwargs):
             super().__init__(*args, **kwargs)
             self.tracer = trace.get_tracer(__name__)
+            self.session_context = Context()
+
+        def on_start(self):
+            session_id = str(uuid.uuid4())
+            logging.info(f"Starting browser user session: {session_id}")
+            ctx = baggage.set_baggage("session.id", session_id)
+            ctx = baggage.set_baggage("synthetic_request", "true", context=ctx)
+            self.session_context = ctx
+            context.attach(ctx)
 
         @task
         @pw
         async def open_cart_page_and_change_currency(self, page: PageWithRetry):
-            with self.tracer.start_as_current_span("browser_change_currency", context=Context()):
+            with self.tracer.start_as_current_span("browser_change_currency", context=self.session_context):
                 try:
                     page.on("console", lambda msg: print(msg.text))
                     await page.route('**/*', add_baggage_header)
@@ -245,7 +260,7 @@ if browser_traffic_enabled:
         @task
         @pw
         async def add_product_to_cart(self, page: PageWithRetry):
-            with self.tracer.start_as_current_span("browser_add_to_cart", context=Context()):
+            with self.tracer.start_as_current_span("browser_add_to_cart", context=self.session_context):
                 try:
                     page.on("console", lambda msg: print(msg.text))
                     await page.route('**/*', add_baggage_header)
