@@ -35,8 +35,16 @@ jobs:
       fail-fast: false
       matrix:
         # Add a component here once we've landed Cribl patches for it.
-        component:
-          - load-generator
+        # Note: cart's Dockerfile lives at src/cart/src/Dockerfile, not
+        # src/cart/Dockerfile — `dockerfile` overrides the convention when set.
+        include:
+          - component: load-generator
+          - component: cart
+            dockerfile: src/cart/src/Dockerfile
+          - component: checkout
+          - component: payment
+          - component: recommendation
+          - component: frontend
     steps:
       - uses: actions/checkout@v4
 
@@ -58,7 +66,7 @@ jobs:
         uses: docker/build-push-action@v6
         with:
           context: .
-          file: ./src/${{ matrix.component }}/Dockerfile
+          file: ${{ matrix.dockerfile || format('./src/{0}/Dockerfile', matrix.component) }}
           push: true
           tags: |
             ${{ env.IMAGE_BASE }}:${{ steps.sha.outputs.short }}-${{ matrix.component }}
