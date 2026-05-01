@@ -31,6 +31,7 @@ from opentelemetry.exporter.otlp.proto.grpc._log_exporter import OTLPLogExporter
 from opentelemetry.sdk._logs import LoggerProvider, LoggingHandler
 from opentelemetry.sdk._logs.export import BatchLogRecordProcessor
 from opentelemetry.sdk.resources import Resource
+from opentelemetry.processor.baggage import BaggageSpanProcessor
 
 from openfeature import api
 from openfeature.contrib.provider.ofrep import OFREPProvider
@@ -41,6 +42,7 @@ from playwright.async_api import Route, Request
 # Configure tracer provider first (needed for trace context in logs)
 tracer_provider = TracerProvider()
 trace.set_tracer_provider(tracer_provider)
+tracer_provider.add_span_processor(BaggageSpanProcessor(lambda key: key == "session.id"))
 tracer_provider.add_span_processor(BatchSpanProcessor(OTLPSpanExporter(insecure=True)))
 
 # Configure logger provider with the same resource
