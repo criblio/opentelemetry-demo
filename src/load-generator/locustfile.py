@@ -96,18 +96,56 @@ categories = [
     None,
 ]
 
+# Real product IDs from src/product-catalog/products/products.json. Weighted
+# so a few SKUs dominate (head) and the rest see long-tail traffic — the
+# Pareto-style shape real e-commerce sites see.
 products = [
+    "OLJCESPC7Z",  # head
+    "66VCHSJNUP",
     "0PUK6V6EV0",
     "1YMWWN1N4O",
+    "L9ECAV7KIM",
     "2ZYFJ3GM2N",
-    "66VCHSJNUP",
     "6E92ZMYYFZ",
     "9SIQT8TOJO",
-    "L9ECAV7KIM",
     "LS4PSXUNUM",
-    "OLJCESPC7Z",
-    "HQTGWGPNH4",
+    "HQTGWGPNH4",  # tail
 ]
+product_weights = [10, 7, 5, 4, 3, 2, 2, 1, 1, 1]
+
+# Drives intentional 4xx traffic. Real production traffic gets bots/scrapers
+# /broken bookmarks/typo'd URLs hitting paths like these; the APM app must
+# cope without help. Per docs/load-generator-traffic-plan.md: do NOT tag
+# these so the APM can filter them out — that defeats the test.
+invalid_product_ids = [
+    "DEADBEEF99",   # well-formed but unknown
+    "NOTAPRODUCT",
+    "12345",
+    "../../etc/passwd",  # path-traversal-ish; should bounce
+    "%00",           # null byte
+]
+
+# (Accept-Language, User-Agent) tuples picked at on_start. Mix of desktop,
+# mobile, and a small fraction of bot-ish UAs so the APM can demonstrate
+# UA/locale facets and bot filtering.
+user_profiles = [
+    ("en-US,en;q=0.9", "Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/121.0.0.0 Safari/537.36"),
+    ("en-GB,en;q=0.9", "Mozilla/5.0 (Macintosh; Intel Mac OS X 10_15_7) AppleWebKit/605.1.15 (KHTML, like Gecko) Version/17.2.1 Safari/605.1.15"),
+    ("de-DE,de;q=0.9,en;q=0.8", "Mozilla/5.0 (X11; Linux x86_64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/121.0.0.0 Safari/537.36"),
+    ("ja-JP,ja;q=0.9,en;q=0.8", "Mozilla/5.0 (iPhone; CPU iPhone OS 17_2 like Mac OS X) AppleWebKit/605.1.15 (KHTML, like Gecko) Version/17.2 Mobile/15E148 Safari/604.1"),
+    ("fr-FR,fr;q=0.9,en;q=0.8", "Mozilla/5.0 (Linux; Android 14) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/121.0.0.0 Mobile Safari/537.36"),
+    ("es-ES,es;q=0.9,en;q=0.8", "Mozilla/5.0 (Windows NT 10.0; Win64; x64; rv:121.0) Gecko/20100101 Firefox/121.0"),
+    ("zh-CN,zh;q=0.9", "Mozilla/5.0 (X11; CrOS x86_64 14541.0.0) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/121.0.0.0 Safari/537.36"),
+    # Bot-ish UAs — small slice of real traffic; APM should be able to
+    # surface or filter these without our help.
+    ("en-US,en;q=0.5", "curl/8.4.0"),
+    ("en-US,en;q=0.5", "python-requests/2.31.0"),
+]
+
+# Currency codes the demo's currency service supports, weighted toward
+# USD so most traffic is the home currency.
+currencies = ["USD", "EUR", "GBP", "JPY", "CAD", "AUD", "CHF", "INR"]
+currency_weights = [40, 15, 10, 8, 6, 6, 5, 10]
 
 people_file = open('people.json')
 people = json.load(people_file)
@@ -121,6 +159,18 @@ class WebsiteUser(HttpUser):
         # Default until on_start() runs; ensures tasks always have a valid
         # parent context even if Locust schedules one before on_start finishes.
         self.session_context = Context()
+        self.currency = "USD"
+
+    def _pick_product(self):
+        return random.choices(products, weights=product_weights, k=1)[0]
+
+    def _params(self, **extra):
+        # currencyCode goes on every API call so the BFF threads it through
+        # to currency / product-catalog / shipping. extra lets callers add
+        # task-specific params (productIds, contextKeys, …).
+        p = {"currencyCode": self.currency}
+        p.update(extra)
+        return p
 
     @task(1)
     def index(self):
@@ -130,46 +180,40 @@ class WebsiteUser(HttpUser):
 
     @task(10)
     def browse_product(self):
-        product = random.choice(products)
+        product = self._pick_product()
         with self.tracer.start_as_current_span("user_browse_product", context=self.session_context, attributes={"product.id": product}):
             logging.info(f"User browsing product: {product}")
-            self.client.get("/api/products/" + product)
+            self.client.get("/api/products/" + product, params=self._params())
 
     @task(3)
     def get_recommendations(self):
-        product = random.choice(products)
+        product = self._pick_product()
         with self.tracer.start_as_current_span("user_get_recommendations", context=self.session_context, attributes={"product.id": product}):
             logging.info(f"User getting recommendations for product: {product}")
-            params = {
-                "productIds": [product],
-            }
-            self.client.get("/api/recommendations", params=params)
+            self.client.get("/api/recommendations", params=self._params(productIds=[product]))
 
     @task(3)
     def get_ads(self):
         category = random.choice(categories)
         with self.tracer.start_as_current_span("user_get_ads", context=self.session_context, attributes={"category": str(category)}):
             logging.info(f"User getting ads for category: {category}")
-            params = {
-                "contextKeys": [category],
-            }
-            self.client.get("/api/data/", params=params)
+            self.client.get("/api/data/", params=self._params(contextKeys=[category]))
 
     @task(3)
     def view_cart(self):
         with self.tracer.start_as_current_span("user_view_cart", context=self.session_context):
             logging.info("User viewing cart")
-            self.client.get("/api/cart")
+            self.client.get("/api/cart", params=self._params())
 
     @task(2)
     def add_to_cart(self, user=""):
         if user == "":
             user = str(uuid.uuid1())
-        product = random.choice(products)
+        product = self._pick_product()
         quantity = random.choice([1, 2, 3, 4, 5, 10])
         with self.tracer.start_as_current_span("user_add_to_cart", context=self.session_context, attributes={"user.id": user, "product.id": product, "quantity": quantity}):
             logging.info(f"User {user} adding {quantity} of product {product} to cart")
-            self.client.get("/api/products/" + product)
+            self.client.get("/api/products/" + product, params=self._params())
             cart_item = {
                 "item": {
                     "productId": product,
@@ -177,7 +221,7 @@ class WebsiteUser(HttpUser):
                 },
                 "userId": user,
             }
-            self.client.post("/api/cart", json=cart_item)
+            self.client.post("/api/cart", json=cart_item, params=self._params())
 
     @task(1)
     def checkout(self):
@@ -186,7 +230,7 @@ class WebsiteUser(HttpUser):
             self.add_to_cart(user=user)
             checkout_person = random.choice(people)
             checkout_person["userId"] = user
-            self.client.post("/api/checkout", json=checkout_person)
+            self.client.post("/api/checkout", json=checkout_person, params=self._params())
             logging.info(f"Checkout completed for user {user}")
 
     @task(1)
@@ -199,7 +243,7 @@ class WebsiteUser(HttpUser):
                 self.add_to_cart(user=user)
             checkout_person = random.choice(people)
             checkout_person["userId"] = user
-            self.client.post("/api/checkout", json=checkout_person)
+            self.client.post("/api/checkout", json=checkout_person, params=self._params())
             logging.info(f"Multi-item checkout completed for user {user}")
 
     @task(5)
@@ -211,9 +255,31 @@ class WebsiteUser(HttpUser):
                 for _ in range(0, flood_count):
                     self.client.get("/")
 
+    @task(2)
+    def bad_request(self):
+        # Steady trickle of 4xx-producing requests modeling bots, scrapers,
+        # broken bookmarks, and typo'd URLs. NOT tagged as synthetic — the
+        # APM app must surface/group/silence these on its own merits. The
+        # 4xx will count toward Locust's failure stats, which is realistic
+        # for an operator's view of the world. name= groups the per-id
+        # requests under one stats row so the locust UI stays readable.
+        bad = random.choice(invalid_product_ids)
+        with self.tracer.start_as_current_span("user_bad_request", context=self.session_context, attributes={"product.id": bad}):
+            self.client.get(f"/api/products/{bad}", params=self._params(),
+                            name="/api/products/[invalid]")
+
     def on_start(self):
         session_id = str(uuid.uuid4())
         logging.info(f"Starting user session: {session_id}")
+        # Per-user persona: language/UA + currency. Locust's HttpUser session
+        # holds these as defaults, applied to every request.
+        accept_lang, user_agent = random.choice(user_profiles)
+        self.client.headers.update({
+            "Accept-Language": accept_lang,
+            "User-Agent": user_agent,
+        })
+        self.currency = random.choices(currencies, weights=currency_weights, k=1)[0]
+        logging.info(f"Session profile: lang={accept_lang!r} currency={self.currency} ua={user_agent[:40]!r}")
         ctx = baggage.set_baggage("session.id", session_id)
         ctx = baggage.set_baggage("synthetic_request", "true", context=ctx)
         # Stash for use as parent context in every task — keeps each task as
