@@ -9,7 +9,7 @@ import random
 import uuid
 import logging
 
-from locust import HttpUser, task, between
+from locust import HttpUser, LoadTestShape, task, between
 from locust_plugins.users.playwright import PlaywrightUser, pw, PageWithRetry, event
 
 from opentelemetry import context, baggage, trace
@@ -150,8 +150,95 @@ currency_weights = [40, 15, 10, 8, 6, 6, 5, 10]
 people_file = open('people.json')
 people = json.load(people_file)
 
-class WebsiteUser(HttpUser):
-    wait_time = between(1, 10)
+# Subset of user_profiles whose UA looks mobile — used by the Mobile persona
+# so its sessions consistently look like phone traffic.
+mobile_user_profiles = [p for p in user_profiles if 'iPhone' in p[1] or 'Android' in p[1]]
+
+
+# === Module-level task functions ============================================
+# Each takes a User instance (locust passes `self` as the first arg when a
+# bare callable is in the User's tasks list). Defining them at module level
+# (rather than as @task methods on a class) lets multiple persona classes
+# compose their own task mixes without inheritance gymnastics.
+
+def t_index(user):
+    with user.tracer.start_as_current_span("user_index", context=user.session_context):
+        user.client.get("/")
+
+def t_browse_product(user):
+    product = user._pick_product()
+    with user.tracer.start_as_current_span("user_browse_product", context=user.session_context, attributes={"product.id": product}):
+        user.client.get("/api/products/" + product, params=user._params())
+
+def t_get_recommendations(user):
+    product = user._pick_product()
+    with user.tracer.start_as_current_span("user_get_recommendations", context=user.session_context, attributes={"product.id": product}):
+        user.client.get("/api/recommendations", params=user._params(productIds=[product]))
+
+def t_get_ads(user):
+    category = random.choice(categories)
+    with user.tracer.start_as_current_span("user_get_ads", context=user.session_context, attributes={"category": str(category)}):
+        user.client.get("/api/data/", params=user._params(contextKeys=[category]))
+
+def t_view_cart(user):
+    with user.tracer.start_as_current_span("user_view_cart", context=user.session_context):
+        user.client.get("/api/cart", params=user._params())
+
+def _add_to_cart(user, user_id):
+    """Underlying add-to-cart helper; called as a task and from checkout flows."""
+    product = user._pick_product()
+    quantity = random.choice([1, 2, 3, 4, 5, 10])
+    with user.tracer.start_as_current_span("user_add_to_cart", context=user.session_context, attributes={"user.id": user_id, "product.id": product, "quantity": quantity}):
+        user.client.get("/api/products/" + product, params=user._params())
+        cart_item = {"item": {"productId": product, "quantity": quantity}, "userId": user_id}
+        user.client.post("/api/cart", json=cart_item, params=user._params())
+
+def t_add_to_cart(user):
+    _add_to_cart(user, str(uuid.uuid1()))
+
+def t_checkout(user):
+    user_id = str(uuid.uuid1())
+    with user.tracer.start_as_current_span("user_checkout_single", context=user.session_context, attributes={"user.id": user_id}):
+        _add_to_cart(user, user_id)
+        person = random.choice(people)
+        person["userId"] = user_id
+        user.client.post("/api/checkout", json=person, params=user._params())
+
+def t_checkout_multi(user):
+    user_id = str(uuid.uuid1())
+    item_count = random.choice([2, 3, 4])
+    with user.tracer.start_as_current_span("user_checkout_multi", context=user.session_context, attributes={"user.id": user_id, "item.count": item_count}):
+        for _ in range(item_count):
+            _add_to_cart(user, user_id)
+        person = random.choice(people)
+        person["userId"] = user_id
+        user.client.post("/api/checkout", json=person, params=user._params())
+
+def t_flood_home(user):
+    flood_count = get_flagd_value("loadGeneratorFloodHomepage")
+    if flood_count > 0:
+        with user.tracer.start_as_current_span("user_flood_home", context=user.session_context, attributes={"flood.count": flood_count}):
+            for _ in range(flood_count):
+                user.client.get("/")
+
+def t_bad_request(user):
+    # Steady trickle of 4xx-producing requests modeling bots, scrapers,
+    # broken bookmarks, and typo'd URLs. NOT tagged as synthetic — the
+    # APM app must surface/group/silence these on its own merits. The
+    # 4xx counts toward Locust's failure stats, which is what an operator
+    # would see. name= groups the per-id requests under one stats row.
+    bad = random.choice(invalid_product_ids)
+    with user.tracer.start_as_current_span("user_bad_request", context=user.session_context, attributes={"product.id": bad}):
+        user.client.get(f"/api/products/{bad}", params=user._params(), name="/api/products/[invalid]")
+
+
+# === Persona classes ========================================================
+# Each persona is a separate HttpUser class with its own task mix and
+# wait_time. `weight` controls the spawn ratio across personas.
+
+class _BaseUser(HttpUser):
+    abstract = True  # locust won't spawn instances of the base class
+    profile_pool = user_profiles  # subclasses can narrow (Mobile does)
 
     def __init__(self, *args, **kwargs):
         super().__init__(*args, **kwargs)
@@ -172,122 +259,110 @@ class WebsiteUser(HttpUser):
         p.update(extra)
         return p
 
-    @task(1)
-    def index(self):
-        with self.tracer.start_as_current_span("user_index", context=self.session_context):
-            logging.info("User accessing index page")
-            self.client.get("/")
-
-    @task(10)
-    def browse_product(self):
-        product = self._pick_product()
-        with self.tracer.start_as_current_span("user_browse_product", context=self.session_context, attributes={"product.id": product}):
-            logging.info(f"User browsing product: {product}")
-            self.client.get("/api/products/" + product, params=self._params())
-
-    @task(3)
-    def get_recommendations(self):
-        product = self._pick_product()
-        with self.tracer.start_as_current_span("user_get_recommendations", context=self.session_context, attributes={"product.id": product}):
-            logging.info(f"User getting recommendations for product: {product}")
-            self.client.get("/api/recommendations", params=self._params(productIds=[product]))
-
-    @task(3)
-    def get_ads(self):
-        category = random.choice(categories)
-        with self.tracer.start_as_current_span("user_get_ads", context=self.session_context, attributes={"category": str(category)}):
-            logging.info(f"User getting ads for category: {category}")
-            self.client.get("/api/data/", params=self._params(contextKeys=[category]))
-
-    @task(3)
-    def view_cart(self):
-        with self.tracer.start_as_current_span("user_view_cart", context=self.session_context):
-            logging.info("User viewing cart")
-            self.client.get("/api/cart", params=self._params())
-
-    @task(2)
-    def add_to_cart(self, user=""):
-        if user == "":
-            user = str(uuid.uuid1())
-        product = self._pick_product()
-        quantity = random.choice([1, 2, 3, 4, 5, 10])
-        with self.tracer.start_as_current_span("user_add_to_cart", context=self.session_context, attributes={"user.id": user, "product.id": product, "quantity": quantity}):
-            logging.info(f"User {user} adding {quantity} of product {product} to cart")
-            self.client.get("/api/products/" + product, params=self._params())
-            cart_item = {
-                "item": {
-                    "productId": product,
-                    "quantity": quantity,
-                },
-                "userId": user,
-            }
-            self.client.post("/api/cart", json=cart_item, params=self._params())
-
-    @task(1)
-    def checkout(self):
-        user = str(uuid.uuid1())
-        with self.tracer.start_as_current_span("user_checkout_single", context=self.session_context, attributes={"user.id": user}):
-            self.add_to_cart(user=user)
-            checkout_person = random.choice(people)
-            checkout_person["userId"] = user
-            self.client.post("/api/checkout", json=checkout_person, params=self._params())
-            logging.info(f"Checkout completed for user {user}")
-
-    @task(1)
-    def checkout_multi(self):
-        user = str(uuid.uuid1())
-        item_count = random.choice([2, 3, 4])
-        with self.tracer.start_as_current_span("user_checkout_multi", context=self.session_context,
-                                            attributes={"user.id": user, "item.count": item_count}):
-            for i in range(item_count):
-                self.add_to_cart(user=user)
-            checkout_person = random.choice(people)
-            checkout_person["userId"] = user
-            self.client.post("/api/checkout", json=checkout_person, params=self._params())
-            logging.info(f"Multi-item checkout completed for user {user}")
-
-    @task(5)
-    def flood_home(self):
-        flood_count = get_flagd_value("loadGeneratorFloodHomepage")
-        if flood_count > 0:
-            with self.tracer.start_as_current_span("user_flood_home",  context=self.session_context, attributes={"flood.count": flood_count}):
-                logging.info(f"User flooding homepage {flood_count} times")
-                for _ in range(0, flood_count):
-                    self.client.get("/")
-
-    @task(2)
-    def bad_request(self):
-        # Steady trickle of 4xx-producing requests modeling bots, scrapers,
-        # broken bookmarks, and typo'd URLs. NOT tagged as synthetic — the
-        # APM app must surface/group/silence these on its own merits. The
-        # 4xx will count toward Locust's failure stats, which is realistic
-        # for an operator's view of the world. name= groups the per-id
-        # requests under one stats row so the locust UI stays readable.
-        bad = random.choice(invalid_product_ids)
-        with self.tracer.start_as_current_span("user_bad_request", context=self.session_context, attributes={"product.id": bad}):
-            self.client.get(f"/api/products/{bad}", params=self._params(),
-                            name="/api/products/[invalid]")
-
     def on_start(self):
         session_id = str(uuid.uuid4())
-        logging.info(f"Starting user session: {session_id}")
-        # Per-user persona: language/UA + currency. Locust's HttpUser session
-        # holds these as defaults, applied to every request.
-        accept_lang, user_agent = random.choice(user_profiles)
+        accept_lang, user_agent = random.choice(self.profile_pool)
         self.client.headers.update({
             "Accept-Language": accept_lang,
             "User-Agent": user_agent,
         })
         self.currency = random.choices(currencies, weights=currency_weights, k=1)[0]
-        logging.info(f"Session profile: lang={accept_lang!r} currency={self.currency} ua={user_agent[:40]!r}")
+        logging.info(f"[{type(self).__name__}] session={session_id[:8]} lang={accept_lang!r} currency={self.currency} ua={user_agent[:40]!r}")
         ctx = baggage.set_baggage("session.id", session_id)
         ctx = baggage.set_baggage("synthetic_request", "true", context=ctx)
         # Stash for use as parent context in every task — keeps each task as
         # its own trace root (no parent span) while letting baggage flow.
         self.session_context = ctx
         context.attach(ctx)
+        # Every persona starts with a homepage hit, simulating an arrival.
         with self.tracer.start_as_current_span("user_session_start", context=self.session_context):
-            self.index()
+            t_index(self)
+
+
+class Browser(_BaseUser):
+    """Window shopper. Heavy browse + recommendations, low cart conversion,
+    never checks out. Owns the bad_request slice (most realistic for a
+    casual browser to fat-finger URLs or hit stale links)."""
+    weight = 6
+    wait_time = between(2, 8)
+    tasks = {
+        t_browse_product: 10,
+        t_get_recommendations: 3,
+        t_get_ads: 3,
+        t_view_cart: 2,
+        t_add_to_cart: 1,
+        t_index: 1,
+        t_flood_home: 2,
+        t_bad_request: 2,
+    }
+
+
+class Buyer(_BaseUser):
+    """Decisive shopper. Short browse, then checkout. Few task types, high
+    conversion."""
+    weight = 2
+    wait_time = between(1, 3)
+    tasks = {
+        t_browse_product: 2,
+        t_view_cart: 1,
+        t_add_to_cart: 3,
+        t_checkout: 4,
+        t_checkout_multi: 2,
+    }
+
+
+class Abandoner(_BaseUser):
+    """Adds items to cart, never checks out. Real e-commerce pain pattern."""
+    weight = 2
+    wait_time = between(2, 6)
+    tasks = {
+        t_browse_product: 3,
+        t_view_cart: 2,
+        t_add_to_cart: 4,
+        t_get_recommendations: 2,
+        # Intentionally no checkout / checkout_multi.
+    }
+
+
+class Mobile(_BaseUser):
+    """Phone user: shorter wait_time, restricted to mobile UAs. Smaller
+    catalog interactions, occasional checkout."""
+    weight = 3
+    wait_time = between(1, 4)
+    profile_pool = mobile_user_profiles
+    tasks = {
+        t_browse_product: 5,
+        t_view_cart: 1,
+        t_add_to_cart: 2,
+        t_checkout: 1,
+    }
+
+
+# === Load shape =============================================================
+
+class StagedSpike(LoadTestShape):
+    """
+    Deterministic 10-min cycle: warm → ramp → peak (flash sale) → cool → idle.
+    Picked deterministic per docs/load-generator-traffic-plan.md so APM
+    features can be validated against a known curve. Cycle repeats so the
+    pattern is observable indefinitely without re-running locust.
+    """
+    # (cumulative_seconds_within_cycle, target_users, spawn_rate)
+    stages = [
+        (60,   5,  1),   # 0-1m: warm-up
+        (180, 15,  2),   # 1-3m: morning ramp
+        (300, 25,  3),   # 3-5m: peak / flash sale
+        (420, 10,  2),   # 5-7m: cool-down
+        (600,  5,  1),   # 7-10m: idle
+    ]
+    cycle_seconds = 600
+
+    def tick(self):
+        run_time = self.get_run_time() % self.cycle_seconds
+        for stage_time, users, spawn in self.stages:
+            if run_time < stage_time:
+                return (users, spawn)
+        return None  # should be unreachable
 
 
 browser_traffic_enabled = os.environ.get("LOCUST_BROWSER_TRAFFIC_ENABLED", "").lower() in ("true", "yes", "on")
