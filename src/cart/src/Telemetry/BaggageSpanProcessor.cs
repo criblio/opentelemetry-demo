@@ -4,6 +4,7 @@
 using System;
 using System.Collections.Concurrent;
 using System.Diagnostics;
+using System.Threading;
 using OpenTelemetry;
 
 namespace cart.telemetry;
@@ -22,9 +23,14 @@ namespace cart.telemetry;
 // Why the SessionScope fallback: StackExchange.Redis dispatches commands
 // via a ConnectionMultiplexer that uses worker threads outside the
 // request's AsyncLocal flow. Baggage.Current is empty in those threads
-// even at OnEnd. Program.cs's EnrichWithHttpRequest callback captures
-// session.id into a per-trace-id table on server-span start; Redis child
-// spans look it up here by their TraceId.
+// even at OnEnd. Worse, the Redis instrumentation batches its
+// profiler-entry-to-Activity conversion via a Timer (default
+// FlushInterval = 10s), so the Redis Activity is created and OnEnd
+// fires *seconds after* the originating request has already completed.
+// Program.cs's EnrichWithHttpRequest captures session.id into a per-
+// trace-id table at server-span start; this OnEnd looks it up. The
+// table is sized by a TTL longer than the Redis flush window so the
+// entry is still there when the deferred Redis spans land.
 public class BaggageSpanProcessor : BaseProcessor<Activity>
 {
     private readonly Func<string, bool> _keyPredicate;
@@ -52,30 +58,40 @@ public class BaggageSpanProcessor : BaseProcessor<Activity>
                 activity.SetTag("session.id", sid);
             }
         }
-
-        if (activity.Parent == null)
-        {
-            SessionScope.Release(activity.TraceId);
-        }
     }
 }
 
 internal static class SessionScope
 {
-    private static readonly ConcurrentDictionary<ActivityTraceId, string> _byTrace = new();
+    // TTL must comfortably exceed StackExchange.Redis instrumentation's
+    // FlushInterval (default 10s) plus typical request handler duration,
+    // since Redis Activity OnEnd runs on the flush timer, not when the
+    // Redis call completes.
+    private static readonly TimeSpan _ttl = TimeSpan.FromMinutes(1);
+    private static readonly ConcurrentDictionary<ActivityTraceId, (string Value, DateTimeOffset Expires)> _byTrace = new();
+    private static readonly Timer _sweep = new(_ => Sweep(), null, _ttl, _ttl);
 
     public static void Capture(ActivityTraceId traceId, string sessionId)
     {
-        _byTrace[traceId] = sessionId;
+        _byTrace[traceId] = (sessionId, DateTimeOffset.UtcNow + _ttl);
     }
 
     public static string Lookup(ActivityTraceId traceId)
     {
-        return _byTrace.TryGetValue(traceId, out var v) ? v : null;
+        return _byTrace.TryGetValue(traceId, out var entry) && entry.Expires > DateTimeOffset.UtcNow
+            ? entry.Value
+            : null;
     }
 
-    public static void Release(ActivityTraceId traceId)
+    private static void Sweep()
     {
-        _byTrace.TryRemove(traceId, out _);
+        var now = DateTimeOffset.UtcNow;
+        foreach (var kvp in _byTrace)
+        {
+            if (kvp.Value.Expires <= now)
+            {
+                _byTrace.TryRemove(kvp.Key, out _);
+            }
+        }
     }
 }
