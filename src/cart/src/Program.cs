@@ -10,6 +10,7 @@ using Microsoft.AspNetCore.Http;
 using Microsoft.Extensions.DependencyInjection;
 using Microsoft.Extensions.Diagnostics.HealthChecks;
 using Microsoft.Extensions.Logging;
+using OpenTelemetry;
 using OpenTelemetry.Instrumentation.StackExchangeRedis;
 using OpenTelemetry.Logs;
 using OpenTelemetry.Metrics;
@@ -68,7 +69,21 @@ builder.Services.AddOpenTelemetry()
         .AddSource("OpenTelemetry.Demo.Cart")
         .AddRedisInstrumentation(
             options => options.SetVerboseDatabaseStatements = true)
-        .AddAspNetCoreInstrumentation()
+        .AddAspNetCoreInstrumentation(options =>
+        {
+            // Capture session.id from inbound baggage on the server activity
+            // and stash it by TraceId so child spans created on threads where
+            // AsyncLocal didn't flow (StackExchange.Redis multiplexer) can
+            // still find it in BaggageSpanProcessor.OnEnd.
+            options.EnrichWithHttpRequest = (activity, _) =>
+            {
+                var sessionId = Baggage.Current.GetBaggage("session.id");
+                if (sessionId != null)
+                {
+                    cart.telemetry.SessionScope.Capture(activity.TraceId, sessionId);
+                }
+            };
+        })
         .AddGrpcClientInstrumentation()
         .AddHttpClientInstrumentation()
         .AddOtlpExporter())

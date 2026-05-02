@@ -2,6 +2,7 @@
 // SPDX-License-Identifier: Apache-2.0
 
 using System;
+using System.Collections.Concurrent;
 using System.Diagnostics;
 using OpenTelemetry;
 
@@ -16,9 +17,14 @@ namespace cart.telemetry;
 // the inbound server Activity is created by ASP.NET Core *before* the
 // HttpInListener observes the diagnostic event and extracts baggage from
 // headers into Baggage.Current. So at OnStart, Baggage.Current is still
-// empty for the server span. By OnEnd, the propagator has run and
-// (for child activities created during the request) AsyncLocal context
-// has had a chance to restore from sync Redis-style thread hops too.
+// empty for the server span. By OnEnd, the propagator has run.
+//
+// Why the SessionScope fallback: StackExchange.Redis dispatches commands
+// via a ConnectionMultiplexer that uses worker threads outside the
+// request's AsyncLocal flow. Baggage.Current is empty in those threads
+// even at OnEnd. Program.cs's EnrichWithHttpRequest callback captures
+// session.id into a per-trace-id table on server-span start; Redis child
+// spans look it up here by their TraceId.
 public class BaggageSpanProcessor : BaseProcessor<Activity>
 {
     private readonly Func<string, bool> _keyPredicate;
@@ -37,5 +43,39 @@ public class BaggageSpanProcessor : BaseProcessor<Activity>
                 activity.SetTag(entry.Key, entry.Value);
             }
         }
+
+        if (_keyPredicate("session.id") && activity.GetTagItem("session.id") == null)
+        {
+            var sid = SessionScope.Lookup(activity.TraceId);
+            if (sid != null)
+            {
+                activity.SetTag("session.id", sid);
+            }
+        }
+
+        if (activity.Parent == null)
+        {
+            SessionScope.Release(activity.TraceId);
+        }
+    }
+}
+
+internal static class SessionScope
+{
+    private static readonly ConcurrentDictionary<ActivityTraceId, string> _byTrace = new();
+
+    public static void Capture(ActivityTraceId traceId, string sessionId)
+    {
+        _byTrace[traceId] = sessionId;
+    }
+
+    public static string Lookup(ActivityTraceId traceId)
+    {
+        return _byTrace.TryGetValue(traceId, out var v) ? v : null;
+    }
+
+    public static void Release(ActivityTraceId traceId)
+    {
+        _byTrace.TryRemove(traceId, out _);
     }
 }
