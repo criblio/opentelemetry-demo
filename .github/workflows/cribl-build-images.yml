@@ -42,6 +42,9 @@ jobs:
           - component: cart
             dockerfile: src/cart/src/Dockerfile
           - component: checkout
+          - component: currency
+            build-args: |
+              OPENTELEMETRY_CPP_VERSION=1.24.0
           - component: payment
           - component: recommendation
           - component: frontend
@@ -68,6 +71,7 @@ jobs:
           context: .
           file: ${{ matrix.dockerfile || format('./src/{0}/Dockerfile', matrix.component) }}
           push: true
+          build-args: ${{ matrix.build-args }}
           tags: |
             ${{ env.IMAGE_BASE }}:${{ steps.sha.outputs.short }}-${{ matrix.component }}
           cache-from: type=gha,scope=${{ matrix.component }}
