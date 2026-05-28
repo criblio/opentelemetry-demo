@@ -39,6 +39,7 @@ jobs:
         # src/cart/Dockerfile — `dockerfile` overrides the convention when set.
         include:
           - component: load-generator
+          - component: accounting
           - component: cart
             dockerfile: src/cart/src/Dockerfile
           - component: checkout

@@ -5,6 +5,7 @@ using Confluent.Kafka;
 using Microsoft.Extensions.Logging;
 using Oteldemo;
 using Microsoft.EntityFrameworkCore;
+using Npgsql;
 using System.Diagnostics;
 
 namespace Accounting;
@@ -64,7 +65,10 @@ internal class Consumer : IDisposable
                 {
                     using var activity = MyActivitySource.StartActivity("order-consumed",  ActivityKind.Internal);
                     var consumeResult = _consumer.Consume();
-                    ProcessMessage(consumeResult.Message);
+                    if (ProcessMessage(consumeResult.Message))
+                    {
+                        _consumer.Commit(consumeResult);
+                    }
                 }
                 catch (ConsumeException e)
                 {
@@ -83,7 +87,7 @@ internal class Consumer : IDisposable
         }
     }
 
-    private void ProcessMessage(Message<string, byte[]> message)
+    private bool ProcessMessage(Message<string, byte[]> message)
     {
         try
         {
@@ -92,10 +96,20 @@ internal class Consumer : IDisposable
 
             if (_dbConnectionString == null)
             {
-                return;
+                return true;
             }
 
             using var dbContext = new DBContext();
+
+            if (dbContext.Orders.Any(o => o.Id == order.OrderId))
+            {
+                if (_logger.IsEnabled(LogLevel.Information))
+                {
+                    _logger.LogInformation("Order {OrderId} already persisted; idempotent skip", order.OrderId);
+                }
+                return true;
+            }
+
             var orderEntity = new OrderEntity
             {
                 Id = order.OrderId
@@ -131,10 +145,17 @@ internal class Consumer : IDisposable
             };
             dbContext.Add(shipping);
             dbContext.SaveChanges();
+            return true;
+        }
+        catch (DbUpdateException ex) when (ex.InnerException is PostgresException pe && pe.SqlState == "23505")
+        {
+            _logger.LogInformation(ex, "Order duplicate hit between idempotency check and insert; treating as success");
+            return true;
         }
         catch (Exception ex)
         {
-            _logger.LogError(ex, "Order parsing failed:");
+            _logger.LogError(ex, "Order processing failed; offset will not be committed and message will be redelivered");
+            return false;
         }
     }
 
@@ -146,7 +167,11 @@ internal class Consumer : IDisposable
             BootstrapServers = servers,
             // https://github.com/confluentinc/confluent-kafka-dotnet/tree/07de95ed647af80a0db39ce6a8891a630423b952#basic-consumer-example
             AutoOffsetReset = AutoOffsetReset.Earliest,
-            EnableAutoCommit = true
+            // Manual commit: only advance the offset after the DB write succeeds.
+            // With auto-commit a crash mid-batch loses the commit but keeps the
+            // already-written rows in Postgres — on restart the same orders
+            // get redelivered and every order_pkey insert fails 23505.
+            EnableAutoCommit = false
         };
 
         return new ConsumerBuilder<string, byte[]>(conf)
