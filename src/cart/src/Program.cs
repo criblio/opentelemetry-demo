@@ -112,4 +112,18 @@ app.MapGet("/", async context =>
     await context.Response.WriteAsync("Communication with gRPC endpoints must be made through a gRPC client. To learn how to create a client, visit: https://go.microsoft.com/fwlink/?linkid=2086909");
 });
 
+// HTTP readiness endpoint that honors the failedReadinessProbe flagd flag.
+// Upstream wires this through the .NET HealthCheckService + custom gRPC
+// HealthServiceImpl, but on .NET 10 the empty-service Health.Check path
+// keeps returning SERVING regardless of the flag's value (verified with
+// grpc-health-probe against cart:8080), so the failure scenario silently
+// no-ops. This HTTP endpoint bypasses that machinery and reads the flag
+// directly via IFeatureClient. K8s readinessProbe is configured as
+// httpGet: /healthz in helm-values.
+app.MapGet("/healthz", async (OpenFeature.IFeatureClient featureClient) =>
+{
+    bool failed = await featureClient.GetBooleanValueAsync("failedReadinessProbe", false);
+    return failed ? Results.StatusCode(503) : Results.Ok();
+});
+
 app.Run();
